@@ -8,12 +8,12 @@
 
 import io
 import re
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
-import math
 
 st.set_page_config(page_title="Terminal Data Quality Report", layout="wide")
 st.title("📦 Terminal Data Quality Report (CET)")
@@ -49,7 +49,7 @@ CET_TZ = ZoneInfo("Europe/Copenhagen")
 def ensure_column_after(df: pd.DataFrame, after_col: str, new_col: str, values) -> pd.DataFrame:
     """
     Overwrite-or-create `new_col` and then move it to be directly after `after_col`.
-    Safe to call multiple times (idempotent) to avoid 'already exists' insert errors.
+    Safe to call multiple times (idempotent) to avoid 'already exists' errors.
     """
     df[new_col] = values  # overwrite or create
     cols = list(df.columns)
@@ -60,9 +60,47 @@ def ensure_column_after(df: pd.DataFrame, after_col: str, new_col: str, values) 
         df = df[cols]
     return df
 
-def parse_datetime_utc(series: pd.Series) -> pd.Series:
-    """Robust UTC parsing."""
-    return pd.to_datetime(series, utc=True, errors="coerce")
+def robust_parse_datetime_utc(series: pd.Series) -> pd.Series:
+    """
+    Robust UTC parsing:
+    1) pandas default
+    2) dayfirst=True (common EU)
+    3) explicit formats
+    """
+    s = series.astype(str).str.strip()
+
+    # pass 1: pandas default
+    dt = pd.to_datetime(s, utc=True, errors="coerce")
+
+    # pass 2: dayfirst
+    mask = dt.isna()
+    if mask.any():
+        dt2 = pd.to_datetime(s[mask], utc=True, dayfirst=True, errors="coerce")
+        dt.loc[mask] = dt2
+
+    # pass 3: explicit formats for stubborn cases
+    patterns = [
+        "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%b-%Y %H:%M",
+        "%Y-%m-%dT%H:%M:%S",        # ISO without Z
+        "%Y-%m-%dT%H:%M:%S.%f",    # ISO with microseconds
+    ]
+    mask = dt.isna()
+    if mask.any():
+        for pat in patterns:
+            try:
+                parsed = pd.to_datetime(s[mask], format=pat, utc=True, errors="coerce")
+                fill_mask = parsed.notna()
+                dt.loc[mask[mask].index[fill_mask]] = parsed[fill_mask]
+                mask = dt.isna()
+                if not mask.any():
+                    break
+            except Exception:
+                pass
+
+    return dt
 
 def normalize_origin(x: str) -> str:
     """Clean-up mojibake (e.g., 'Br√∏ndby DC' → 'Brondby') and common suffixes."""
@@ -169,12 +207,38 @@ if run:
         st.stop()
 
     # Build CET (always recompute from UTC source)
-    utc_series = parse_datetime_utc(df["Destination initial planned arrival time"])
+    utc_series = robust_parse_datetime_utc(df["Destination initial planned arrival time"])
     cet_series = utc_series.dt.tz_convert(CET_TZ)
     df = ensure_column_after(df, "Destination initial planned arrival time", "CET", cet_series)
 
+    # Diagnostics BEFORE filtering
+    total_rows = len(df)
+    parsed_ok = int(cet_series.notna().sum())
+    parsed_ratio = 0 if total_rows == 0 else parsed_ok / total_rows
+    cet_min = cet_series.min() if parsed_ok > 0 else None
+    cet_max = cet_series.max() if parsed_ok > 0 else None
+
+    with st.expander("🔎 Data diagnostics", expanded=True):
+        st.write(f"Total rows: **{total_rows}**")
+        st.write(f"Parsed CET timestamps: **{parsed_ok}** ({parsed_ratio:.0%})")
+        if cet_min is not None:
+            st.write(f"Dataset CET range: **{cet_min}** → **{cet_max}**")
+        else:
+            st.write("Dataset CET range: _no parsable timestamps_")
+        st.write("Sample of original planned-arrival values (first 5 non-null):")
+        sample_dates = df.loc[df["Destination initial planned arrival time"].notna(),
+                              "Destination initial planned arrival time"].head(5)
+        st.write(sample_dates)
+
     # Filter by CET range
     mask = filter_by_cet_range(df["CET"], start_date, end_date)
+    matched_rows = int(mask.sum())
+    if matched_rows == 0:
+        st.warning(
+            "No rows matched the selected CET date range. "
+            "Check the **Data diagnostics** above and align Start/End dates with the dataset CET range."
+        )
+
     df_filtered = df.loc[mask].copy()
 
     # Normalize origins
@@ -186,12 +250,9 @@ if run:
         sub = df_filtered[df_filtered["_OriginNorm"] == origin]
 
         planned = int(len(sub))
-
-        # Actual deliveries: non-blank & parseable datetimes
         actual_series = sub["Stop actual arrival time"]
         actual = int(actual_series.apply(is_nonblank_datetime).sum())
 
-        # Delayed deliveries: positive in Stop arrival delta (minutes)
         delta = pd.to_numeric(sub["Stop arrival delta (minutes)"], errors="coerce")
         delayed = int((delta > 0).sum())
 
