@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
+import math
 
 st.set_page_config(page_title="Terminal Data Quality Report", layout="wide")
 st.title("📦 Terminal Data Quality Report (CET)")
@@ -108,6 +109,20 @@ def make_tz_naive_for_excel(df_in: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_datetime64tz_dtype(df_out[c]):
             df_out[c] = df_out[c].dt.tz_localize(None)
     return df_out
+
+def safe_column_width(series: pd.Series, min_w: int = 12, max_w: int = 40) -> int:
+    """
+    Robust width estimator from string lengths; never throws.
+    Falls back to min_w when data is empty or quantile is NaN/invalid.
+    """
+    try:
+        lengths = series.astype(str).str.len()
+        q = lengths.quantile(0.95)
+        if pd.isna(q) or not np.isfinite(q):
+            return min_w
+        return int(max(min_w, min(max_w, math.ceil(q))))
+    except Exception:
+        return min_w
 
 # ----------------------------
 # UI inputs
@@ -229,9 +244,9 @@ if run:
             fmt = header_format_yellow if col_name in NEEDED_HEADERS_HIGHLIGHT else header_format_default
             ws_main.write(0, col_idx, col_name, fmt)
 
-        # Column widths
+        # Column widths (robust)
         for idx, col in enumerate(df_out.columns):
-            width = max(12, min(40, int(df_out[col].astype(str).str.len().quantile(0.95))))
+            width = safe_column_width(df_out[col])
             ws_main.set_column(idx, idx, width)
 
         # Terminal Data Quality sheet
