@@ -1,47 +1,25 @@
 # app.py
+# ---------------------------
+# Terminal Data Quality Report (CET)
+# ---------------------------
+# Run: streamlit run app.py
+# Requires: streamlit, pandas, numpy, xlsxwriter
+# ---------------------------
+
 import io
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Terminal Data Quality Report", layout="wide")
-
 st.title("📦 Terminal Data Quality Report (CET)")
-st.caption("Upload your CSV, pick a date range, and download a formatted Excel report.")
+st.caption("Upload the CSV, pick a date range, and download a formatted Excel report.")
 
 # ----------------------------
-# UI Inputs
-# ----------------------------
-uploaded_csv = st.file_uploader("Upload the main CSV", type=["csv"])
-
-# Default origins per your spec (editable)
-default_origins = ["Brondby", "Hasselager", "Lineage", "Odense", "Hilton"]
-origins = st.multiselect(
-    "Origins to include",
-    options=default_origins,
-    default=default_origins,
-    help="You can add/remove origins if needed. Mojibake like 'Br√∏ndby DC' is normalized to 'Brondby'."
-)
-
-# Date range (CET)
-col_a, col_b = st.columns(2)
-with col_a:
-    start_date = st.date_input("Start Date (CET)", value=date(2024, 9, 29))
-with col_b:
-    end_date = st.date_input("End Date (CET)", value=date(2024, 10, 6))
-
-if end_date < start_date:
-    st.error("End Date must be on or after Start Date.")
-    st.stop()
-
-# Process button
-run = st.button("Generate Excel Report", type="primary", use_container_width=True)
-
-# ----------------------------
-# Helpers
+# Config / constants
 # ----------------------------
 NEEDED_HEADERS_HIGHLIGHT = {
     "Stop type",
@@ -54,35 +32,44 @@ NEEDED_HEADERS_HIGHLIGHT = {
 
 TDQ_COL_ORDER = [
     "Origin",
-    "Registration Rate",      # moved before Planned Deliveries
-    "Delivery Precision",     # moved before Planned Deliveries
+    "Registration Rate",     # placed before Planned Deliveries
+    "Delivery Precision",    # placed before Planned Deliveries
     "Planned Deliveries",
     "Actual Deliveries",
     "Delayed Deliveries",
 ]
 
-def insert_column_after(df, after_col, new_col, values):
+DEFAULT_ORIGINS = ["Brondby", "Hasselager", "Lineage", "Odense", "Hilton"]
+CET_TZ = ZoneInfo("Europe/Copenhagen")
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def ensure_column_after(df: pd.DataFrame, after_col: str, new_col: str, values) -> pd.DataFrame:
+    """
+    Overwrite-or-create `new_col` and then move it to be directly after `after_col`.
+    Safe to call multiple times (idempotent) to avoid 'already exists' insert errors.
+    """
+    df[new_col] = values  # overwrite or create
     cols = list(df.columns)
-    if after_col not in cols:
-        df[new_col] = values
-        return df
-    i = cols.index(after_col) + 1
-    df.insert(i, new_col, values)
+    if after_col in cols:
+        cols.remove(new_col)
+        insert_at = cols.index(after_col) + 1
+        cols.insert(insert_at, new_col)
+        df = df[cols]
     return df
 
-def parse_datetime_utc(x):
-    if pd.isna(x):
-        return pd.NaT
-    return pd.to_datetime(x, utc=True, errors="coerce")
+def parse_datetime_utc(series: pd.Series) -> pd.Series:
+    """Robust UTC parsing."""
+    return pd.to_datetime(series, utc=True, errors="coerce")
 
 def normalize_origin(x: str) -> str:
+    """Clean-up mojibake (e.g., 'Br√∏ndby DC' → 'Brondby') and common suffixes."""
     if not isinstance(x, str):
         return ""
     s = x.strip()
     s_lower = s.lower()
-    # Fix mojibake & accents -> brondby
     s_lower = s_lower.replace("br√∏ndby", "brondby").replace("brøndby", "brondby")
-    # Drop common suffix like " dc"
     s_lower = re.sub(r"\s+dc\b", "", s_lower)
     if "brondby" in s_lower:
         return "Brondby"
@@ -94,52 +81,88 @@ def normalize_origin(x: str) -> str:
         return "Odense"
     if "hilton" in s_lower:
         return "Hilton"
-    return s  # keep original otherwise
+    return s  # keep original text otherwise
 
-def is_nonblank(val):
-    """Treat '', ' ', np.nan, 'NaT', and whitespace-only as blank."""
-    if val is None:
+def is_nonblank_datetime(val) -> bool:
+    """Count as 'actual' only if non-blank and parseable to a datetime."""
+    if pd.isna(val):
         return False
-    s = str(val)
-    if s.lower() in ("nan", "nat"):
+    s = str(val).strip()
+    if s == "" or s.lower() in ("nan", "nat", "none"):
         return False
-    return s.strip() != ""
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    return pd.notna(dt)
 
-def filter_by_cet_range(cet_series, start_d: date, end_d: date):
-    """Keep rows whose CET timestamp is within [start_d 00:00:00, end_d 23:59:59.999999]."""
+def filter_by_cet_range(cet_series: pd.Series, start_d: date, end_d: date) -> pd.Series:
+    """Keep rows whose CET timestamp is within [start_d 00:00, end_d 23:59:59.999] inclusive."""
     if cet_series.isna().all():
-        return cet_series.notna() & False  # empty mask if no dates
-    start_dt = datetime.combine(start_d, time.min).replace(tzinfo=ZoneInfo("Europe/Copenhagen"))
-    # End inclusive: push to the end of the day
-    end_dt = datetime.combine(end_d, time.max).replace(tzinfo=ZoneInfo("Europe/Copenhagen"))
+        return cet_series.notna() & False
+    start_dt = datetime.combine(start_d, time.min).replace(tzinfo=CET_TZ)
+    end_dt = datetime.combine(end_d, time.max).replace(tzinfo=CET_TZ)
     return (cet_series >= pd.Timestamp(start_dt)) & (cet_series <= pd.Timestamp(end_dt))
 
+def make_tz_naive_for_excel(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Excel can't store tz-aware datetimes; strip tz info."""
+    df_out = df_in.copy()
+    for c in df_out.columns:
+        if pd.api.types.is_datetime64tz_dtype(df_out[c]):
+            df_out[c] = df_out[c].dt.tz_localize(None)
+    return df_out
+
 # ----------------------------
-# Main action
+# UI inputs
+# ----------------------------
+uploaded_csv = st.file_uploader("Upload the main CSV", type=["csv"])
+
+origins = st.multiselect(
+    "Origins to include",
+    options=DEFAULT_ORIGINS,
+    default=DEFAULT_ORIGINS,
+    help="Edit as needed. Mojibake like 'Br√∏ndby DC' is normalized to 'Brondby'."
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("Start Date (CET)", value=date(2024, 9, 29))
+with col2:
+    end_date = st.date_input("End Date (CET)", value=date(2024, 10, 6))
+
+if end_date < start_date:
+    st.error("End Date must be on or after Start Date.")
+    st.stop()
+
+run = st.button("Generate Excel Report", type="primary", use_container_width=True)
+
+# ----------------------------
+# Main
 # ----------------------------
 if run:
     if uploaded_csv is None:
-        st.error("Please upload the main CSV first.")
+        st.error("Please upload the CSV first.")
         st.stop()
 
-    # Load CSV
     df = pd.read_csv(uploaded_csv)
 
-    # Ensure required columns exist (create blank if missing to avoid hard errors)
+    # Ensure required headers exist (avoid hard failures if missing)
     for col in NEEDED_HEADERS_HIGHLIGHT:
         if col not in df.columns:
             df[col] = pd.Series([np.nan] * len(df))
 
-    # Build CET column next to Destination initial planned arrival time
-    utc_series = df["Destination initial planned arrival time"].apply(parse_datetime_utc)
-    cet_series = utc_series.dt.tz_convert(ZoneInfo("Europe/Copenhagen"))
-    df = insert_column_after(df, "Destination initial planned arrival time", "CET", cet_series)
+    # Validate mandatory field presence
+    if "Destination initial planned arrival time" not in df.columns:
+        st.error("The CSV must contain the column 'Destination initial planned arrival time'.")
+        st.stop()
 
-    # Filter rows by CET ∈ [start_date, end_date] inclusive
+    # Build CET (always recompute from UTC source)
+    utc_series = parse_datetime_utc(df["Destination initial planned arrival time"])
+    cet_series = utc_series.dt.tz_convert(CET_TZ)
+    df = ensure_column_after(df, "Destination initial planned arrival time", "CET", cet_series)
+
+    # Filter by CET range
     mask = filter_by_cet_range(df["CET"], start_date, end_date)
     df_filtered = df.loc[mask].copy()
 
-    # Normalize origins (mojibake fixes etc.)
+    # Normalize origins
     df_filtered["_OriginNorm"] = df_filtered["Origin"].apply(normalize_origin)
 
     # Compute Terminal Data Quality metrics
@@ -147,12 +170,13 @@ if run:
     for origin in origins:
         sub = df_filtered[df_filtered["_OriginNorm"] == origin]
 
-        planned = len(sub)
-        # Actual deliveries: count non-blank "Stop actual arrival time"
-        actual_times = sub["Stop actual arrival time"]
-        actual = int(actual_times.apply(is_nonblank).sum())
+        planned = int(len(sub))
 
-        # Delayed deliveries: positive values in Stop arrival delta (minutes)
+        # Actual deliveries: non-blank & parseable datetimes
+        actual_series = sub["Stop actual arrival time"]
+        actual = int(actual_series.apply(is_nonblank_datetime).sum())
+
+        # Delayed deliveries: positive in Stop arrival delta (minutes)
         delta = pd.to_numeric(sub["Stop arrival delta (minutes)"], errors="coerce")
         delayed = int((delta > 0).sum())
 
@@ -170,32 +194,29 @@ if run:
 
     tdq_df = pd.DataFrame(results, columns=TDQ_COL_ORDER)
 
-    # Header table ("Terminal Quality") - only once
+    # Single “Terminal Quality” header table
     header_table = pd.DataFrame({
         "Terminal Quality": ["Start Date", "End Date", "Carrier"],
         "Value": [start_date.strftime("%d-%b"), end_date.strftime("%d-%b"), "All"]
     })
 
-    # Prepare Excel in memory
-    # Make timezone-naive for Excel compatibility
-    df_out = df_filtered.copy()
-    for c in df_out.columns:
-        if pd.api.types.is_datetime64tz_dtype(df_out[c]):
-            df_out[c] = df_out[c].dt.tz_localize(None)
+    # Prepare Excel (strip tz for Excel compatibility)
+    df_out = make_tz_naive_for_excel(df_filtered)
 
     output = io.BytesIO()
     main_sheet_name = "Main (Filtered to CET Range)"
     tdq_sheet = "Terminal Data Quality"
 
-    with pd.ExcelWriter(output, engine="xlsxwriter",
-                        datetime_format="yyyy-mm-dd hh:mm:ss",
-                        date_format="yyyy-mm-dd") as writer:
+    with pd.ExcelWriter(
+        output, engine="xlsxwriter",
+        datetime_format="yyyy-mm-dd hh:mm:ss", date_format="yyyy-mm-dd"
+    ) as writer:
         # Main data
         df_out.to_excel(writer, index=False, sheet_name=main_sheet_name)
         wb = writer.book
         ws_main = writer.sheets[main_sheet_name]
 
-        # Header formats
+        # Header formatting
         header_format_default = wb.add_format({
             "bold": True, "text_wrap": True, "valign": "top", "border": 1
         })
@@ -203,7 +224,7 @@ if run:
             "bold": True, "text_wrap": True, "valign": "top", "border": 1, "bg_color": "#FFF59D"
         })
 
-        # Re-write header row to apply highlight formatting
+        # Re-write header row with highlight
         for col_idx, col_name in enumerate(df_out.columns):
             fmt = header_format_yellow if col_name in NEEDED_HEADERS_HIGHLIGHT else header_format_default
             ws_main.write(0, col_idx, col_name, fmt)
@@ -218,26 +239,25 @@ if run:
         tdq_df.to_excel(writer, index=False, sheet_name=tdq_sheet, startrow=len(header_table) + 2)
         ws_tdq = writer.sheets[tdq_sheet]
 
-        # Style header table
+        # Style header summary table (only once)
         bold_fmt = wb.add_format({"bold": True, "bg_color": "#E0E0E0", "border": 1})
         val_fmt = wb.add_format({"border": 1})
         for i in range(len(header_table)):
             ws_tdq.write(i, 0, header_table.iloc[i, 0], bold_fmt)
             ws_tdq.write(i, 1, header_table.iloc[i, 1], val_fmt)
 
-        # Style TDQ headers and percentages
+        # Style TDQ headers + percentages
         for col_idx, col_name in enumerate(tdq_df.columns):
             ws_tdq.write(len(header_table) + 2, col_idx, col_name, header_format_default)
 
         pct_fmt = wb.add_format({"num_format": "0.00%"})
-        # Set % formatting on the correct columns
         reg_idx = tdq_df.columns.get_loc("Registration Rate")
         prec_idx = tdq_df.columns.get_loc("Delivery Precision")
         ws_tdq.set_column(reg_idx, reg_idx, 18, pct_fmt)
         ws_tdq.set_column(prec_idx, prec_idx, 18, pct_fmt)
 
-        # Widths for others
-        for name, i in zip(tdq_df.columns, range(len(tdq_df.columns))):
+        # Widths for the others
+        for i, name in enumerate(tdq_df.columns):
             if name not in ["Registration Rate", "Delivery Precision"]:
                 ws_tdq.set_column(i, i, 20)
 
@@ -256,8 +276,9 @@ if run:
 
 st.markdown("""
 **Notes**
-- Times are converted from UTC to CET/CEST using `Europe/Copenhagen`.
-- The CET filter applies to the range you select (inclusive).
-- “Actual Deliveries” counts only non-blank values in **Stop actual arrival time**.
-- “Carrier” is shown **once** in the header summary.  
+- Times are converted from UTC to CET/CEST (`Europe/Copenhagen`).
+- The CET filter uses the selected **Start Date** and **End Date** (inclusive).
+- **Actual Deliveries** count only non-blank, parseable datetimes in **Stop actual arrival time**.
+- **Registration Rate** and **Delivery Precision** appear **before** **Planned Deliveries** in the report.
+- “Carrier” appears **once** in the header summary (value: **All**).
 """)
