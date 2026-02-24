@@ -31,12 +31,13 @@ NEEDED_HEADERS_HIGHLIGHT = {
     "Destination initial planned arrival time",
 }
 
+# ✅ UPDATED ORDER HERE
 TDQ_COL_ORDER = [
     "Origin",
-    "Registration Rate",     # placed before Planned Deliveries
-    "Delivery Precision",    # placed before Planned Deliveries
+    "Delivery Precision",
     "Planned Deliveries",
     "Actual Deliveries",
+    "Registration Rate",
     "Delayed Deliveries",
 ]
 
@@ -261,10 +262,10 @@ if run:
 
         results.append({
             "Origin": origin,
-            "Registration Rate": reg_rate,
             "Delivery Precision": del_prec,
             "Planned Deliveries": planned,
             "Actual Deliveries": actual,
+            "Registration Rate": reg_rate,
             "Delayed Deliveries": delayed,
         })
 
@@ -355,6 +356,5 @@ st.markdown("""
 - Times are converted from UTC to CET/CEST (`Europe/Copenhagen`).
 - The CET filter uses the selected **Start Date** and **End Date** (inclusive).
 - **Actual Deliveries** count only non-blank, parseable datetimes in **Stop actual arrival time**.
-- **Registration Rate** and **Delivery Precision** appear **before** **Planned Deliveries** in the report.
-- “Carrier” appears **once** in the header summary (value: **All**).
+- Table order updated to: Origin → Delivery Precision → Planned → Actual → Registration Rate → Delayed.
 """)
